@@ -196,6 +196,25 @@ def _make_qdrant_client() -> QdrantClient:
 # Cliente global de Qdrant
 qdrant = _make_qdrant_client()
 
+def _qdrant_filter_by_filename(filename: str) -> qmodels.Filter:
+    """
+    Construye un filtro de Qdrant para seleccionar todos los puntos asociados a un archivo PDF concreto, usando su nombre.
+
+    Argumentos:
+        filename: Nombre del archivo PDF.
+
+    Returns:
+        Filtro listo para usar para busqeuda o borrado.
+    """
+    return qmodels.Filter(
+        must=[
+            qmodels.FieldCondition(
+                key="metadata.filename",
+                match=qmodels.MatchValue(value=filename),
+            )
+        ]
+    )
+
 # =========================
 # OVM mínimo (Object–Vector Mapping)
 # =========================
@@ -449,6 +468,28 @@ def recuperacion_chunk(user_query: str, k: int = 1) -> list[VectorBaseDocument]:
 
     return docs
 
+def recuperacion_chunk_con_scores(user_query: str, k: int = 10) -> list[qmodels.ScoredPoint]:
+    """
+    Recupera los k chunks más similares desde Qdrant, incluyendo score e id del punto.
+    """
+    # Embedding de la pregunta
+    query_vector = embedding_model(user_query, to_list=True)
+    try:
+        VectorBaseDocument._ensure_collection()
+
+        # Query con scores
+        res = qdrant.query_points(
+            collection_name=VectorBaseDocument.get_collection_name(),
+            query=query_vector,
+            limit=k,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return getattr(res, "points", res)
+    except Exception as e:
+        logger.warning("Qdrant no disponible para recuperar chunks: %s", e)
+        return []
+
 
 # =========================
 # Ollama
@@ -510,47 +551,82 @@ def obtener_mejor_chunk(
     model: str = "llama3.1:8b-instruct-q4_K_M",
     ) -> dict:
     """
-    1) Recupera de Qdrant el chunk más parecido a la pregunta.
-    2) Construye un prompt para Ollama con ese chunk.
-    3) Llama a Ollama para que genere la respuesta usando SOLO ese chunk.
+    1) Recupera de Qdrant los 10 chunk más parecido a la pregunta.
+    2) Construye un prompt para Ollama con esos chunk.
+    3) Llama a Ollama para que genere la respuesta usando los chunk.
     4) Devuelve:
         - answer: respuesta del LLM
         - title: título del archivo
         - filename: nombre del PDF
         - segment_index: número de segmento
         - chunk: texto del fragmento usado
+        - retrieved: top 10 chunks 
     """
-    info = obtener_chunk_de_query(user_query)
-    if info is None or not info.get("chunk"):
+    user_query = (user_query or "").strip()
+
+    points = recuperacion_chunk_con_scores(user_query, k=10)
+    if not points:
         return {
             "answer": "No he encontrado ningún fragmento relevante en la base de datos.",
             "title": "",
             "filename": "",
             "segment_index": -1,
             "chunk": "",
+            "retrieved": [],
         }
+    
+    # Normaliza a lista de dicts
+    retrieved: list[dict] = []
+    context_blocks: list[str] = []
+    
+    for idx, p in enumerate(points, start=1):
+        payload = p.payload or {}
+        meta = (payload.get("metadata") or {})
+        content = payload.get("content", "") or ""
 
-    # Prompt para que Ollama conteste usando sólo ese chunk
+        item = {
+            "ranking": idx,
+            "similitud": float(getattr(p, "score", 0.0)),
+            "qdrant_point_id": str(getattr(p, "id", "")),
+            "document_id": meta.get("document_id"),
+            "doc_sha256": meta.get("sha256"),
+            "segment_index": meta.get("segment_index", -1),
+            "filename": meta.get("filename", ""),
+            "title": meta.get("title", ""),
+            "chunk": content,
+        }
+        retrieved.append(item)
+        context_blocks.append(
+            f"""[CHUNK #{idx} | score={item['similitud']:.6f} | file={item['filename']} | seg={item['segment_index']}]
+            \"\"\"{content}\"\"\""""
+        )
+        
+    best = retrieved[0]
+        
+    # Prompt para que Ollama conteste usando los 10 chunk en ranking
     prompt = f"""
-    Usa EXCLUSIVAMENTE el siguiente fragmento del pliego para responder.
-
-    Título del archivo: {info['title']}
-    Nombre del archivo: {info['filename']}
-    Índice de segmento: {info['segment_index']}
-
-    Fragmento:
-    \"\"\"{info['chunk']}\"\"\"
+    Usa EXCLUSIVAMENTE los fragmentos proporcionados (CHUNK #1 a CHUNK #10) para responder.
+    Si la respuesta no puede deducirse de esos fragmentos, di explícitamente que no hay información suficiente.
 
     Pregunta del usuario:
     {user_query}
+    
+    Fragmentos (ordenados por relevancia):
+    {chr(10).join(context_blocks)}
 
     Responde de forma breve y precisa en español.
     """
 
     answer = ask_ollama(prompt, model=model)
 
-    info["answer"] = answer
-    return info
+    return {
+        "answer": answer,
+        "title": best.get("title", ""),
+        "filename": best.get("filename", ""),
+        "segment_index": best.get("segment_index", -1),
+        "chunk": best.get("chunk", ""),
+        "retrieved": retrieved, 
+    }
 
 
 if __name__ == "__main__":
